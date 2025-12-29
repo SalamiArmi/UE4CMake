@@ -1,5 +1,6 @@
 
 using UnrealBuildTool;
+using UnrealBuildBase;
 using EpicGames.Core;
 using System;
 using System.Reflection;
@@ -7,6 +8,7 @@ using System.IO;
 using System.Diagnostics;
 using System.Text;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Text.RegularExpressions;
 
 public static class DateTimeExtensions
@@ -27,15 +29,17 @@ public class GeneratorInfo
         m_cCompiler="";
         m_cppCompiler="";
         m_linker="";
+        m_archName="";
     }
 
-    public GeneratorInfo(string name, string options, string cCompiler, string cppCompiler, string linker)
+    public GeneratorInfo(string name, string options, string cCompiler, string cppCompiler, string linker, string archName)
     {
         m_name=name;
         m_options=options;
         m_cCompiler=cCompiler;
         m_cppCompiler=cppCompiler;
         m_linker=linker;
+        m_archName=archName;
     }
 
     public string m_name;
@@ -43,13 +47,17 @@ public class GeneratorInfo
     public string m_cCompiler;
     public string m_cppCompiler;
     public string m_linker;
+    public string m_archName;
+    public string m_enginePath;
 }
 
 public class CMakeTargetInst
 {
+    private string m_engineDirectory;
     private string m_cmakeTargetPath;
     private string m_modulePath;
     private string m_targetName;
+    private string m_targetPlatform;
     private string m_targetLocation;
     private string m_targetPath;
     private string m_cmakeArgs;
@@ -71,9 +79,11 @@ public class CMakeTargetInst
     private bool m_includedToolchain=false;
     private string m_includedToolchainPath;
 
-    public CMakeTargetInst(string targetName, string targetLocation, string args)
+    public CMakeTargetInst(string targetName, string targetPlatform, string targetLocation, string args, string engineDirectory)
     {
+		m_engineDirectory=engineDirectory;
         m_targetName=targetName;
+        m_targetPlatform=targetPlatform;
         m_targetLocation=targetLocation;
 
         Regex buildTypeRegex=new Regex(@"-DCMAKE_BUILD_TYPE=(\w*)");
@@ -114,14 +124,20 @@ public class CMakeTargetInst
         StreamReader reader = new System.IO.StreamReader(m_buildInfoPath);
         string line = null;
 
-        while((line=reader.ReadLine())!=null)
+        while ((line = reader.ReadLine()) != null)
         {
-            string[] tokens = line.Split('=');
+            int separatorIndex = line.IndexOf('=');
 
-            if(tokens.Length!=2)
+            // Skip lines that don't have an '='
+            if (separatorIndex == -1)
                 continue;
 
-            values.Add(tokens[0], tokens[1]);
+            // Extract the token (key) and value
+            string key = line.Substring(0, separatorIndex).Trim();
+            string value = line.Substring(separatorIndex + 1).Trim();
+
+            // Add to the dictionary
+            values.Add(key, value);
         }
 
         if(values.ContainsKey("cppStandard"))
@@ -189,6 +205,7 @@ public class CMakeTargetInst
                     continue;
 
                 rules.PublicIncludePaths.Add(include);
+                Console.WriteLine("PublicIncludePaths.Add("+include+")");
             }
         }
 
@@ -201,8 +218,8 @@ public class CMakeTargetInst
                 if(String.IsNullOrEmpty(binaryDirectory))
                     continue;
 
-                Console.WriteLine("Add library path: "+binaryDirectory);
                 rules.PublicRuntimeLibraryPaths.Add(binaryDirectory);
+                Console.WriteLine("PublicRuntimeLibraryPaths.Add("+binaryDirectory+")");
             }
         }
 
@@ -216,9 +233,25 @@ public class CMakeTargetInst
                     continue;
 
                 rules.PublicAdditionalLibraries.Add(library);
+                Console.WriteLine("PublicAdditionalLibraries.Add("+library+")");
             }
         }
 
+        if(values.ContainsKey("defines"))
+        {
+            string[] defines = values["defines"].Split(',');
+
+            foreach(string define in defines)
+            {
+                if(String.IsNullOrEmpty(define))
+                    continue;
+
+                rules.PublicDefinitions.Add(define);
+                Console.WriteLine("PublicDefinitions.Add("+define+")");
+            }
+        }
+
+        Console.WriteLine("Loading done.");
         return true;
     }
 
@@ -263,8 +296,8 @@ public class CMakeTargetInst
         m_targetPath=Path.Combine(m_modulePath, m_targetLocation);
 
         m_thirdPartyGeneratedPath=Path.Combine(rules.Target.ProjectFile.Directory.FullName, "Intermediate", "CMakeTarget");
-        m_generatedTargetPath=Path.Combine(m_thirdPartyGeneratedPath, m_targetName);
-        m_buildDirectory="build";
+        m_generatedTargetPath=Path.Combine(m_thirdPartyGeneratedPath, m_targetName, m_targetPlatform);
+        m_buildDirectory = "build";
         m_buildPath=Path.Combine(m_generatedTargetPath, m_buildDirectory);
 
         m_buildInfoFile="buildinfo_"+buildType+".output";
@@ -296,10 +329,16 @@ public class CMakeTargetInst
         if(File.Exists(builtFile))
         {
             DateTime cmakeLastWrite=File.GetLastWriteTime(projectCMakeLists);
-            string builtTimeString=System.IO.File.ReadAllText(builtFile);
-            DateTime builtTime=DateTime.Parse(builtTimeString);
+            string[] builtParts = System.IO.File.ReadAllText(builtFile).Split('|');
+            
+            bool paramsMatch = builtParts.Length == 4 
+                && builtParts[0] == m_targetName 
+                && builtParts[1] == m_targetLocation 
+                && builtParts[2] == m_cmakeArgs;
+                
+            DateTime builtTime = DateTime.Parse(builtParts[^1], CultureInfo.InvariantCulture);
 
-            if(builtTime.EqualsUpToSeconds(cmakeLastWrite))
+            if(paramsMatch && builtTime.EqualsUpToSeconds(cmakeLastWrite))
                 configCMake=false;
         }
 
@@ -332,7 +371,8 @@ public class CMakeTargetInst
             {
                 DateTime cmakeLastWrite=File.GetLastWriteTime(projectCMakeLists);
 
-                File.WriteAllText(builtFile, cmakeLastWrite.ToString());
+                string buildInfo = $"{m_targetName}|{m_targetLocation}|{m_cmakeArgs}|{cmakeLastWrite.ToString(CultureInfo.InvariantCulture)}";
+                File.WriteAllText(builtFile, buildInfo);
             }
         }
         return true;
@@ -415,6 +455,7 @@ public class CMakeTargetInst
         string cCompilerPath="";
         string cppCompilerPath="";
         string linkerPath="";
+        string arch_name="";
 
         if((target.Platform == UnrealTargetPlatform.Win64) 
 #if !UE_5_0_OR_LATER
@@ -429,18 +470,47 @@ public class CMakeTargetInst
         {
             name="Unix Makefiles";
             options="";
+            // This name comes from the Linux compiler used by unreal to compile on linux and cross-compile from windows.
+            arch_name="x86_64-unknown-linux-gnu";
 
             UEBuildPlatformSDK? buildSdk=UEBuildPlatformSDK.GetSDKForPlatform(target.Platform.ToString());
 
             if(buildSdk != null)
             {
                 string? internalSDKPath = buildSdk.GetInternalSDKPath();
-
+                if (string.IsNullOrEmpty(internalSDKPath))
+                {
+                    string linuxMultiarchRoot = Environment.GetEnvironmentVariable("LINUX_MULTIARCH_ROOT");
+                    if (!string.IsNullOrEmpty(linuxMultiarchRoot))
+                    {
+                        internalSDKPath = Path.Combine(linuxMultiarchRoot, arch_name);
+                    }
+                }
+                
                 if(!string.IsNullOrEmpty(internalSDKPath))
                 {
                     cCompilerPath=Path.Combine(internalSDKPath, "bin", "clang");
                     cppCompilerPath=Path.Combine(internalSDKPath, "bin", "clang++");
-                    linkerPath=Path.Combine(internalSDKPath, "bin", "lld");
+                    linkerPath=Path.Combine(internalSDKPath, "bin", "lld"); 
+                    
+                    // When cross compiling from Windows ensure to add .exe to the path.
+                    if((BuildHostPlatform.Current.Platform == UnrealTargetPlatform.Win64) 
+#if !UE_5_0_OR_LATER
+                        || (BuildHostPlatform.Current.Platform == UnrealTargetPlatform.Win32)
+#endif//!UE_5_0_OR_LATER
+                    )
+                    {
+                        cCompilerPath += ".exe";
+                        cppCompilerPath += ".exe";
+                        linkerPath += ".exe";
+                    }
+                }
+                else
+                {
+                    // The Linux Toolchain is nost installed, abort the compilation.
+                    // NOTE: Not using the provided Linux toolchain is not supported in unreal nor by this library.
+                    Console.WriteLine("[FATAL] The Linux Toolchain is not installed. Please install it and ensure the `LINUX_MULTIARCH_ROOT` environment variable is correctly set. Usually the Toolchain installer does it automatically.");
+                    Environment.Exit(1);
                 }
             }
         }
@@ -450,7 +520,7 @@ public class CMakeTargetInst
             options="";
         }
 
-        return new GeneratorInfo(name, options, cCompilerPath, cppCompilerPath, linkerPath);
+        return new GeneratorInfo(name, options, cCompilerPath, cppCompilerPath, linkerPath, arch_name);
     }
 
     private string GetCMakeExe()
@@ -473,15 +543,14 @@ public class CMakeTargetInst
         string program = GetCMakeExe();
         string options = "";
 
-        if((BuildHostPlatform.Current.Platform == UnrealTargetPlatform.Win64) 
+        if((target.Platform == UnrealTargetPlatform.Win64) 
 #if !UE_5_0_OR_LATER
-            || (BuildHostPlatform.Current.Platform == UnrealTargetPlatform.Win32)
+            || (target.Platform == UnrealTargetPlatform.Win32)
 #endif//!UE_5_0_OR_LATER
             )
         {
             options=" -T host=x64";
         }
-        
 
         var generatorInfo=GetGeneratorInfo(target, rules);
 
@@ -565,9 +634,17 @@ public class CMakeTargetInst
         else
             contents=contents.Replace("@USE_COMPILER@", "1");
 
-        contents=contents.Replace("@COMPILER@", generatorInfo.m_cCompiler);
-        contents=contents.Replace("@CPPCOMPILER@", generatorInfo.m_cppCompiler);
-        contents=contents.Replace("@LINKER@", generatorInfo.m_linker);
+		contents = contents.Replace("@COMPILER@", generatorInfo.m_cCompiler.Replace("\\", "/"));
+		contents = contents.Replace("@CPPCOMPILER@", generatorInfo.m_cppCompiler.Replace("\\", "/"));
+		contents = contents.Replace("@LINKER@", generatorInfo.m_linker.Replace("\\", "/"));
+		contents = contents.Replace("@ARCH_NAME@", generatorInfo.m_archName);
+
+		// This is an essential piece of the UBT toolchain: It links the c++ standard library provided by unreal.
+		// This piece of code was reverse-engineered from: https://github.com/EpicGames/UnrealEngine/blob/5.4.4-release/Engine/Source/ThirdParty/Alembic/BuildForLinux.sh#L82-L83
+		// Notice -fvisibility=default is necessary to ensure the linking doesn't miss any object.
+		contents = contents.Replace("@C_FLAGS@", "");
+		contents = contents.Replace("@CXX_FLAGS@", " -fvisibility=default -I"+m_engineDirectory.Replace("\\", "/")+"/Source/ThirdParty/Unix/LibCxx/include/c++/v1");
+		contents = contents.Replace("@LINKER_FLAGS@", "-nodefaultlibs -L"+m_engineDirectory.Replace("\\", "/")+"/Source/ThirdParty/Unix/LibCxx/lib/Unix/"+generatorInfo.m_archName+"/");
         
         addIncludedToolchain(ref contents);
 
@@ -600,7 +677,7 @@ public class CMakeTargetInst
     {
         string templateFilePath = Path.Combine(m_cmakeTargetPath, "CMakeLists.in");
         string cmakeFile = Path.Combine(m_generatedTargetPath, "CMakeLists.txt");
-        const string buildDir = "build";//just one for visual studio generator
+        string buildDir = Path.Combine(m_targetPlatform, "build");//just one for visual studio generator
 
         string contents = File.ReadAllText(templateFilePath);
 
@@ -712,7 +789,7 @@ public class CMakeTarget : ModuleRules
     public static bool add(ReadOnlyTargetRules target, ModuleRules rules, string targetName, string targetLocation, string args, bool useSystemCompiler=false)
     {
         Console.WriteLine("CMakeTarget load target: "+targetName+" loc:"+targetLocation);
-        CMakeTargetInst cmakeTarget = new CMakeTargetInst(targetName, targetLocation, args);
+        CMakeTargetInst cmakeTarget = new CMakeTargetInst(targetName, target.Platform.ToString(), targetLocation, args, rules.EngineDirectory);
 
         if(!cmakeTarget.Load(target, rules, useSystemCompiler))
         {
